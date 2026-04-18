@@ -1,4 +1,48 @@
+# Binaries
 guardfs
+*.out
+*.exe
+
+# Object and dependency files
+*.o
+*.obj
+*.a
+*.so
+*.dylib
+*.dll
+*.d
+
+# Build directories
+build/
+cmake-build-*/
+out/
+dist/
+
+# CMake/autotools generated
+CMakeFiles/
+CMakeCache.txt
+cmake_install.cmake
+compile_commands.json
+makedep*
+libtool
+aclocal.m4
+m4/
+autom4te.cache/
+
+# Runtime files for FileGuard
 fileguard.log
 fileguard.hashes
 *.tmp
+
+# IDE/editor
+.idea/
+*.code-workspace
+
+# VS Code local state (keep project settings)
+.vscode/*.db
+.vscode/*.db-*
+.vscode
+
+# OS junk
+.DS_Store
+Thumbs.db
