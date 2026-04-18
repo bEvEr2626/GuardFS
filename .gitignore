@@ -1,0 +1,4 @@
+guardfs
+fileguard.log
+fileguard.hashes
+*.tmp
