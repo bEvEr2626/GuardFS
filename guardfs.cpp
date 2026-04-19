@@ -7,6 +7,7 @@
 #include <format>
 #include <fstream>
 #include <iostream>
+#include <cstdint>
 #include <memory>
 #include <mutex>
 #include <openssl/evp.h>
@@ -28,11 +29,16 @@ struct FileEntry {
 };
 
 struct RuntimeOptions {
-	std::chrono::seconds interval{5};
+	std::chrono::seconds interval{1};
 	std::string targets_file{"fileguard.targets"};
 	std::string hash_db_file{"fileguard.hashes"};
 	std::string log_file{"fileguard.log"};
 	bool once{false};
+};
+
+struct FileFingerprint {
+	uintmax_t size;
+	std::int64_t mtime_ticks;
 };
 
 class HashEngine {
@@ -414,7 +420,38 @@ private:
 	RuntimeOptions options_;
 	Logger& logger_;
 	std::unordered_map<std::string, std::string> file_hashes_;
+	std::unordered_map<std::string, FileFingerprint> file_fingerprints_;
 	std::jthread worker_;
+
+	static std::string stripTrailingSeparators(std::string value) {
+		while (value.size() > 1) {
+			const char last = value.back();
+			if (last != '/' && last != '\\') {
+				break;
+			}
+			value.pop_back();
+		}
+		return value;
+	}
+
+	static bool readFingerprint(const std::string& path, FileFingerprint& fingerprint) {
+		std::error_code ec;
+		const fs::path file_path(path);
+
+		const uintmax_t size = fs::file_size(file_path, ec);
+		if (ec) {
+			return false;
+		}
+
+		ec.clear();
+		const auto mtime = fs::last_write_time(file_path, ec);
+		if (ec) {
+			return false;
+		}
+
+		fingerprint = FileFingerprint{size, static_cast<std::int64_t>(mtime.time_since_epoch().count())};
+		return true;
+	}
 
 	static void sleepInterruptible(std::stop_token stop_token, std::chrono::seconds duration) {
 		const auto until = std::chrono::steady_clock::now() + duration;
@@ -444,12 +481,36 @@ private:
 			paths.push_back(path);
 		}
 
+		std::vector<std::string> paths_to_hash;
+		paths_to_hash.reserve(paths.size());
+		for (const auto& path : paths) {
+			FileFingerprint fingerprint{};
+			if (!readFingerprint(path, fingerprint)) {
+				continue;
+			}
+
+			auto hash_it = file_hashes_.find(path);
+			auto fp_it = file_fingerprints_.find(path);
+			if (hash_it != file_hashes_.end() && fp_it != file_fingerprints_.end()
+				&& fp_it->second.size == fingerprint.size
+				&& fp_it->second.mtime_ticks == fingerprint.mtime_ticks) {
+				continue;
+			}
+
+			file_fingerprints_[path] = fingerprint;
+			paths_to_hash.push_back(path);
+		}
+
+		if (paths_to_hash.empty()) {
+			return;
+		}
+
 		const unsigned hw = std::thread::hardware_concurrency();
-		const size_t worker_count = std::max<size_t>(1, std::min<size_t>(hw == 0 ? 4 : hw, paths.size()));
+		const size_t worker_count = std::max<size_t>(1, std::min<size_t>(hw == 0 ? 4 : hw, paths_to_hash.size()));
 
 		std::atomic_size_t index{0};
 		std::vector<std::pair<std::string, std::string>> hashed_results;
-		hashed_results.reserve(paths.size());
+		hashed_results.reserve(paths_to_hash.size());
 		std::mutex results_mutex;
 
 		{
@@ -460,11 +521,11 @@ private:
 				workers.emplace_back([&](std::stop_token stop_token) {
 					while (!stop_token.stop_requested()) {
 						const size_t current = index.fetch_add(1);
-						if (current >= paths.size()) {
+						if (current >= paths_to_hash.size()) {
 							break;
 						}
 
-						const std::string& path = paths[current];
+						const std::string& path = paths_to_hash[current];
 						const std::string hash = HashEngine::calculateSHA256(path);
 						if (hash.empty()) {
 							continue;
@@ -521,33 +582,79 @@ private:
 			if (entry.recursive) {
 				fs::recursive_directory_iterator iter(input, fs::directory_options::skip_permission_denied, ec);
 				fs::recursive_directory_iterator end;
+				if (ec) {
+					continue;
+				}
 
-				while (!ec && iter != end) {
-					if (iter->is_regular_file(ec) && !ec) {
+				while (iter != end) {
+					std::error_code item_ec;
+					if (iter->is_regular_file(item_ec) && !item_ec) {
 						markTarget(targets, iter->path(), entry.auto_update);
 					}
-					iter.increment(ec);
+
+					item_ec.clear();
+					iter.increment(item_ec);
+					if (item_ec) {
+						item_ec.clear();
+					}
 				}
 				continue;
 			}
 
 			fs::directory_iterator iter(input, fs::directory_options::skip_permission_denied, ec);
 			fs::directory_iterator end;
-			while (!ec && iter != end) {
-				if (iter->is_regular_file(ec) && !ec) {
+			if (ec) {
+				continue;
+			}
+
+			while (iter != end) {
+				std::error_code item_ec;
+				if (iter->is_regular_file(item_ec) && !item_ec) {
 					markTarget(targets, iter->path(), entry.auto_update);
 				}
-				iter.increment(ec);
+
+				item_ec.clear();
+				iter.increment(item_ec);
+				if (item_ec) {
+					item_ec.clear();
+				}
 			}
 		}
 	}
 
 	static void markTarget(std::unordered_map<std::string, bool>& targets, const fs::path& path, bool auto_update) {
 		const std::string key = normalizePath(path);
+		if (isIgnoredPath(key)) {
+			return;
+		}
+
 		auto [it, inserted] = targets.emplace(key, auto_update);
 		if (!inserted && auto_update) {
 			it->second = true;
 		}
+	}
+
+	static bool isIgnoredPath(const std::string& normalized_path) {
+		const std::string normalized = stripTrailingSeparators(normalized_path);
+		for (const auto& prefix : ignoredPathPrefixes()) {
+			if (normalized == prefix) {
+				return true;
+			}
+			if (normalized.size() > prefix.size() && normalized.rfind(prefix, 0) == 0
+				&& (normalized[prefix.size()] == '/' || normalized[prefix.size()] == '\\')) {
+				return true;
+			}
+		}
+		return false;
+	}
+
+	static const std::vector<std::string>& ignoredPathPrefixes() {
+		static const std::vector<std::string> prefixes = [] {
+			std::vector<std::string> result;
+			result.push_back(stripTrailingSeparators(normalizePath(fs::path(expandUserPath("~/.sonarlint")))));
+			return result;
+		}();
+		return prefixes;
 	}
 };
 
