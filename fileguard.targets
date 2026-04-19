@@ -2,7 +2,4 @@
 # recursive: 0 or 1
 # auto_update: 0 or 1
 
-~/.bashrc|0|1
-~/.config|1|1
-~/.local|1|1
-/etc|1|0
+/|1|0
