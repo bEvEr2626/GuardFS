@@ -16,6 +16,7 @@
 #include <string_view>
 #include <thread>
 #include <unordered_map>
+#include <unordered_set>
 #include <utility>
 #include <vector>
 
@@ -393,6 +394,9 @@ class Scanner {
 public:
 	Scanner(RuntimeOptions options, Logger& logger)
 		: options_(std::move(options)), logger_(logger) {
+		ignored_exact_paths_.insert(stripTrailingSeparators(normalizePath(fs::path(options_.targets_file))));
+		ignored_exact_paths_.insert(stripTrailingSeparators(normalizePath(fs::path(options_.hash_db_file))));
+		ignored_exact_paths_.insert(stripTrailingSeparators(normalizePath(fs::path(options_.log_file))));
 		loadHashes(options_.hash_db_file, file_hashes_);
 	}
 
@@ -421,6 +425,7 @@ private:
 	Logger& logger_;
 	std::unordered_map<std::string, std::string> file_hashes_;
 	std::unordered_map<std::string, FileFingerprint> file_fingerprints_;
+	std::unordered_set<std::string> ignored_exact_paths_;
 	std::jthread worker_;
 
 	static std::string stripTrailingSeparators(std::string value) {
@@ -470,10 +475,19 @@ private:
 
 		std::unordered_map<std::string, bool> targets;
 		collectTargetFiles(entries, targets);
+		for (auto it = targets.begin(); it != targets.end();) {
+			if (isIgnoredRuntimePath(it->first)) {
+				it = targets.erase(it);
+			} else {
+				++it;
+			}
+		}
 		if (targets.empty()) {
 			logger_.warn("No readable files found in targets list");
 			return;
 		}
+
+		bool hashes_changed = pruneStaleState(targets);
 
 		std::vector<std::string> paths;
 		paths.reserve(targets.size());
@@ -502,6 +516,9 @@ private:
 		}
 
 		if (paths_to_hash.empty()) {
+			if (hashes_changed && !saveHashes(options_.hash_db_file, file_hashes_)) {
+				logger_.warn(std::format("Failed to save hash DB file: {}", options_.hash_db_file));
+			}
 			return;
 		}
 
@@ -538,7 +555,6 @@ private:
 			}
 		}
 
-		bool hashes_changed = false;
 		for (const auto& [path, new_hash] : hashed_results) {
 			auto existing = file_hashes_.find(path);
 			if (existing == file_hashes_.end()) {
@@ -548,7 +564,9 @@ private:
 			}
 
 			if (existing->second != new_hash) {
-				logger_.fileModified(path, existing->second, new_hash);
+				if (!isIgnoredRuntimePath(path)) {
+					logger_.fileModified(path, existing->second, new_hash);
+				}
 				if (targets[path]) {
 					existing->second = new_hash;
 					hashes_changed = true;
@@ -559,6 +577,29 @@ private:
 		if (hashes_changed && !saveHashes(options_.hash_db_file, file_hashes_)) {
 			logger_.warn(std::format("Failed to save hash DB file: {}", options_.hash_db_file));
 		}
+	}
+
+	bool pruneStaleState(const std::unordered_map<std::string, bool>& targets) {
+		bool changed = false;
+
+		for (auto it = file_hashes_.begin(); it != file_hashes_.end();) {
+			if (!targets.contains(it->first)) {
+				it = file_hashes_.erase(it);
+				changed = true;
+				continue;
+			}
+			++it;
+		}
+
+		for (auto it = file_fingerprints_.begin(); it != file_fingerprints_.end();) {
+			if (!targets.contains(it->first)) {
+				it = file_fingerprints_.erase(it);
+				continue;
+			}
+			++it;
+		}
+
+		return changed;
 	}
 
 	static void collectTargetFiles(const std::vector<FileEntry>& entries, std::unordered_map<std::string, bool>& targets) {
@@ -636,6 +677,16 @@ private:
 
 	static bool isIgnoredPath(const std::string& normalized_path) {
 		const std::string normalized = stripTrailingSeparators(normalized_path);
+		std::string lowered = normalized;
+		std::transform(lowered.begin(), lowered.end(), lowered.begin(), [](unsigned char c) {
+			return static_cast<char>(std::tolower(c));
+		});
+
+		if (lowered.find("/.sonarlint") != std::string::npos || lowered.find("\\.sonarlint") != std::string::npos
+			|| lowered.find("sonarsource.sonarlint-vscode") != std::string::npos) {
+			return true;
+		}
+
 		for (const auto& prefix : ignoredPathPrefixes()) {
 			if (normalized == prefix) {
 				return true;
@@ -645,6 +696,41 @@ private:
 				return true;
 			}
 		}
+		return false;
+	}
+
+	bool isIgnoredRuntimePath(const std::string& normalized_path) const {
+		const std::string normalized = stripTrailingSeparators(normalized_path);
+		if (isIgnoredPath(normalized)) {
+			return true;
+		}
+
+		if (ignored_exact_paths_.contains(normalized)) {
+			return true;
+		}
+
+		std::string lowered = normalized;
+		std::transform(lowered.begin(), lowered.end(), lowered.begin(), [](unsigned char c) {
+			return static_cast<char>(std::tolower(c));
+		});
+
+		static const std::vector<std::string> noisy_segments = {
+			"/.config/code/logs/",
+			"/.config/code/cache/",
+			"/.config/code/user/workspacestorage/",
+			"/.local/share/sddm/",
+			"/.local/share/telegramdesktop/",
+			"/telemetry/",
+			"/cache/",
+			"/tmp/"
+		};
+
+		for (const auto& segment : noisy_segments) {
+			if (lowered.find(segment) != std::string::npos) {
+				return true;
+			}
+		}
+
 		return false;
 	}
 
