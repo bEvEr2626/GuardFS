@@ -7,9 +7,10 @@
 - Мониторинг пользовательского перечня файлов и каталогов.
 - Хеширование файлов по SHA-256 (OpenSSL EVP).
 - Периодическое сканирование с настраиваемым интервалом.
-- Логирование изменений контрольной суммы в `fileguard.log`.
+- Логирование изменений контрольной суммы, а также созданий/удалений (после первого базового прохода) в `fileguard.log`.
 - Автообновление эталонной контрольной суммы для выбранных записей.
 - Автоочистка устаревших записей из `fileguard.hashes` при каждом сканировании.
+- Исключение шумных путей через `fileguard.ignore`.
 - Многопоточное вычисление хешей (`std::jthread`).
 - Встроенное исключение служебного каталога SonarLint (`~/.sonarlint`) из мониторинга.
 - Корректная остановка по `SIGINT`/`SIGTERM`.
@@ -40,6 +41,24 @@ path|recursive|auto_update
 /etc|1|0
 ```
 
+## Исключения (ignore list)
+
+Файл по умолчанию: `fileguard.ignore`.
+
+Формат: одна строка = путь-префикс (абсолютный или с `~`).
+Если путь совпал с префиксом, файл или каталог исключается.
+Файл опционален: если его нет, исключения не применяются.
+
+Пример:
+
+```text
+~/.cache
+~/.config/Code/Cache
+~/.config/Code/CachedData
+~/.config/Code/Service Worker
+/tmp
+```
+
 ## Сборка
 
 Требования:
@@ -64,10 +83,16 @@ make
 ./guardfs
 ```
 
+Демон в фоне (отключается от терминала):
+
+```bash
+./guardfs --daemon
+```
+
 С параметрами:
 
 ```bash
-./guardfs --interval 10 --targets fileguard.targets --hash-db fileguard.hashes --log fileguard.log
+./guardfs --interval 10 --targets fileguard.targets --hash-db fileguard.hashes --log fileguard.log --ignore fileguard.ignore
 ```
 
 Остановка: `Ctrl+C` или `kill` (SIGTERM).

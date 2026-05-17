@@ -1,0 +1,82 @@
+# Paths to exclude from scanning (one per line).
+# Lines are treated as path prefixes (absolute or with ~).
+# Examples:
+#   ~/.cache
+#   ~/.config/Code/Cache
+#   /tmp
+
+# User caches and state
+~/.cache
+~/.local/state
+~/.local/share/Trash
+~/.local/share/recently-used.xbel
+~/.local/share/fish/fish_history
+~/yay
+~/.npm
+~/.config/Code/User/History
+~/.config/Code - OSS
+~/.cristalix
+~/touchegg-git
+~/Downloads/ja-netfilter
+~/.codex
+~/.config/Code/WebStorage
+~/.config/Code/User/globalStorage
+~/.config/Postman
+~/paru
+~/.local/share/Steam
+~/.local/share/Terraria
+~/.local/share/DBeaverData
+~/.local/share/nwg-look
+~/.local/share/spotify-launcher
+~/.local/share/nvm
+~/.eclipse
+
+# Browser/app caches
+~/.config/mozilla
+~/.mozilla
+~/.config/google-chrome
+~/.config/chromium
+
+# VS Code cache and telemetry
+~/.config/Code/logs
+~/.config/Code/Cache
+~/.config/Code/CachedData
+~/.config/Code/Service Worker
+~/.config/Code/User/workspaceStorage
+~/.vscode/extensions
+
+# Temp dirs
+/tmp
+/var/tmp
+
+# System virtual/volatile
+/proc
+/sys
+/dev
+/run
+/var/run
+
+# System noise
+/usr
+/lib
+/lib64
+/bin
+/sbin
+/boot
+/opt
+/srv
+/root
+/var
+/var/log
+/var/cache
+/var/lib/systemd
+/var/lib/NetworkManager
+/var/lib/apt/lists
+/var/lib/dpkg
+/var/lib/pacman
+/var/lib/snapd
+
+# Mounts and external media
+/mnt
+/media
+/snap

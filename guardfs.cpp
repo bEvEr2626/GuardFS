@@ -3,6 +3,7 @@
 #include <chrono>
 #include <csignal>
 #include <ctime>
+#include <fcntl.h>
 #include <filesystem>
 #include <format>
 #include <fstream>
@@ -11,10 +12,13 @@
 #include <memory>
 #include <mutex>
 #include <openssl/evp.h>
+#include <sys/stat.h>
+#include <sys/types.h>
 #include <stop_token>
 #include <string>
 #include <string_view>
 #include <thread>
+#include <unistd.h>
 #include <unordered_map>
 #include <unordered_set>
 #include <utility>
@@ -30,16 +34,19 @@ struct FileEntry {
 };
 
 struct RuntimeOptions {
-	std::chrono::seconds interval{1};
+	std::chrono::seconds interval{5};
 	std::string targets_file{"fileguard.targets"};
 	std::string hash_db_file{"fileguard.hashes"};
 	std::string log_file{"fileguard.log"};
+	std::string ignore_file{"fileguard.ignore"};
 	bool once{false};
+	bool daemon{false};
 };
 
 struct FileFingerprint {
 	uintmax_t size;
 	std::int64_t mtime_ticks;
+	uid_t owner_uid;
 };
 
 class HashEngine {
@@ -105,6 +112,22 @@ public:
 			path,
 			old_hash,
 			new_hash));
+	}
+
+	void fileCreated(const std::string& path, const std::string& new_hash) {
+		writeLine(std::format(
+			"[{}] FILE_CREATED path={} hash={}",
+			timestampNow(),
+			path,
+			new_hash));
+	}
+
+	void fileDeleted(const std::string& path, const std::string& old_hash) {
+		writeLine(std::format(
+			"[{}] FILE_DELETED path={} old={}",
+			timestampNow(),
+			path,
+			old_hash));
 	}
 
 private:
@@ -210,6 +233,31 @@ std::string normalizePath(const fs::path& input) {
 	return input.lexically_normal().string();
 }
 
+std::string stripTrailingSeparators(std::string value) {
+	while (value.size() > 1) {
+		const char last = value.back();
+		if (last != '/' && last != '\\') {
+			break;
+		}
+		value.pop_back();
+	}
+	return value;
+}
+
+bool hasPathPrefix(const std::string& path, const std::string& prefix) {
+	if (prefix.size() == 1 && (prefix[0] == '/' || prefix[0] == '\\')) {
+		return !path.empty() && path[0] == prefix[0];
+	}
+	if (path == prefix) {
+		return true;
+	}
+	if (path.size() <= prefix.size() || path.rfind(prefix, 0) != 0) {
+		return false;
+	}
+	const char next = path[prefix.size()];
+	return next == '/' || next == '\\';
+}
+
 bool loadTargets(const std::string& file_path, std::vector<FileEntry>& entries, std::string& error) {
 	entries.clear();
 
@@ -256,6 +304,43 @@ bool loadTargets(const std::string& file_path, std::vector<FileEntry>& entries, 
 		}
 
 		entries.push_back(FileEntry{expandUserPath(path_part), recursive, auto_update});
+	}
+
+	return true;
+}
+
+bool loadIgnorePrefixes(const std::string& file_path, std::vector<std::string>& prefixes, std::string& error) {
+	prefixes.clear();
+	if (file_path.empty()) {
+		return true;
+	}
+
+	std::ifstream input(file_path);
+	if (!input) {
+		std::error_code ec;
+		if (!fs::exists(file_path, ec)) {
+			return true;
+		}
+		error = std::format("Cannot open ignore file: {}", file_path);
+		return false;
+	}
+
+	std::string line;
+	int line_number = 0;
+	while (std::getline(input, line)) {
+		++line_number;
+		std::string text = trim(line);
+		if (text.empty() || text[0] == '#') {
+			continue;
+		}
+
+		std::string expanded = expandUserPath(text);
+		std::string normalized = stripTrailingSeparators(normalizePath(fs::path(expanded)));
+		if (normalized.empty()) {
+			error = std::format("Invalid ignore value at line {}", line_number);
+			return false;
+		}
+		prefixes.push_back(std::move(normalized));
 	}
 
 	return true;
@@ -315,13 +400,59 @@ bool saveHashes(const std::string& hash_db_file, const std::unordered_map<std::s
 void printUsage(const std::string& app_name) {
 	std::cout
 		<< "Usage:\n"
-		<< "  " << app_name << " [--interval SECONDS] [--targets FILE] [--hash-db FILE] [--log FILE] [--once]\n\n"
+		<< "  " << app_name
+		<< " [--interval SECONDS] [--targets FILE] [--hash-db FILE] [--log FILE] [--ignore FILE] [--once] [--daemon]\n\n"
 		<< "Targets file format (user-editable):\n"
 		<< "  path|recursive|auto_update\n"
 		<< "Examples:\n"
 		<< "  ~/.bashrc|0|1\n"
 		<< "  ~/.config|1|1\n"
 		<< "  /etc|1|0\n";
+}
+
+bool daemonizeProcess(std::string& error) {
+	const pid_t first = ::fork();
+	if (first < 0) {
+		error = "fork() failed";
+		return false;
+	}
+	if (first > 0) {
+		std::_Exit(0);
+	}
+
+	if (::setsid() < 0) {
+		error = "setsid() failed";
+		return false;
+	}
+
+	std::signal(SIGHUP, SIG_IGN);
+
+	const pid_t second = ::fork();
+	if (second < 0) {
+		error = "fork() failed";
+		return false;
+	}
+	if (second > 0) {
+		std::_Exit(0);
+	}
+
+	const int null_fd = ::open("/dev/null", O_RDWR);
+	if (null_fd < 0) {
+		error = "open(/dev/null) failed";
+		return false;
+	}
+	if (::dup2(null_fd, STDIN_FILENO) < 0
+		|| ::dup2(null_fd, STDOUT_FILENO) < 0
+		|| ::dup2(null_fd, STDERR_FILENO) < 0) {
+		error = "dup2() failed";
+		::close(null_fd);
+		return false;
+	}
+	if (null_fd > STDERR_FILENO) {
+		::close(null_fd);
+	}
+
+	return true;
 }
 
 bool parseArguments(int argc, char** argv, RuntimeOptions& options) {
@@ -375,8 +506,20 @@ bool parseArguments(int argc, char** argv, RuntimeOptions& options) {
 			continue;
 		}
 
+		if (arg == "--ignore") {
+			if (!nextValue(options.ignore_file)) {
+				return false;
+			}
+			continue;
+		}
+
 		if (arg == "--once") {
 			options.once = true;
+			continue;
+		}
+
+		if (arg == "--daemon" || arg == "-d") {
+			options.daemon = true;
 			continue;
 		}
 
@@ -386,6 +529,7 @@ bool parseArguments(int argc, char** argv, RuntimeOptions& options) {
 	options.targets_file = expandUserPath(options.targets_file);
 	options.hash_db_file = expandUserPath(options.hash_db_file);
 	options.log_file = expandUserPath(options.log_file);
+	options.ignore_file = expandUserPath(options.ignore_file);
 	return true;
 }
 }  // namespace
@@ -397,7 +541,11 @@ public:
 		ignored_exact_paths_.insert(stripTrailingSeparators(normalizePath(fs::path(options_.targets_file))));
 		ignored_exact_paths_.insert(stripTrailingSeparators(normalizePath(fs::path(options_.hash_db_file))));
 		ignored_exact_paths_.insert(stripTrailingSeparators(normalizePath(fs::path(options_.log_file))));
+		if (!options_.ignore_file.empty()) {
+			ignored_exact_paths_.insert(stripTrailingSeparators(normalizePath(fs::path(options_.ignore_file))));
+		}
 		loadHashes(options_.hash_db_file, file_hashes_);
+		current_uid_ = ::getuid();
 	}
 
 	void runOnce() {
@@ -426,22 +574,18 @@ private:
 	std::unordered_map<std::string, std::string> file_hashes_;
 	std::unordered_map<std::string, FileFingerprint> file_fingerprints_;
 	std::unordered_set<std::string> ignored_exact_paths_;
+	std::vector<std::string> ignore_prefixes_;
 	std::jthread worker_;
-
-	static std::string stripTrailingSeparators(std::string value) {
-		while (value.size() > 1) {
-			const char last = value.back();
-			if (last != '/' && last != '\\') {
-				break;
-			}
-			value.pop_back();
-		}
-		return value;
-	}
+	bool baseline_ready_{false};
+	uid_t current_uid_{0};
 
 	static bool readFingerprint(const std::string& path, FileFingerprint& fingerprint) {
 		std::error_code ec;
 		const fs::path file_path(path);
+		struct stat st {};
+		if (::stat(path.c_str(), &st) != 0) {
+			return false;
+		}
 
 		const uintmax_t size = fs::file_size(file_path, ec);
 		if (ec) {
@@ -454,7 +598,7 @@ private:
 			return false;
 		}
 
-		fingerprint = FileFingerprint{size, static_cast<std::int64_t>(mtime.time_since_epoch().count())};
+		fingerprint = FileFingerprint{size, static_cast<std::int64_t>(mtime.time_since_epoch().count()), st.st_uid};
 		return true;
 	}
 
@@ -466,12 +610,17 @@ private:
 	}
 
 	void scanOnce() {
+		refreshIgnorePrefixes();
+
 		std::vector<FileEntry> entries;
 		std::string load_error;
 		if (!loadTargets(options_.targets_file, entries, load_error)) {
 			logger_.warn(load_error);
 			return;
 		}
+
+		std::vector<std::string> configured_roots;
+		buildConfiguredRoots(entries, configured_roots);
 
 		std::unordered_map<std::string, bool> targets;
 		collectTargetFiles(entries, targets);
@@ -487,7 +636,7 @@ private:
 			return;
 		}
 
-		bool hashes_changed = pruneStaleState(targets);
+		bool hashes_changed = pruneStaleState(targets, configured_roots);
 
 		std::vector<std::string> paths;
 		paths.reserve(targets.size());
@@ -507,7 +656,8 @@ private:
 			auto fp_it = file_fingerprints_.find(path);
 			if (hash_it != file_hashes_.end() && fp_it != file_fingerprints_.end()
 				&& fp_it->second.size == fingerprint.size
-				&& fp_it->second.mtime_ticks == fingerprint.mtime_ticks) {
+				&& fp_it->second.mtime_ticks == fingerprint.mtime_ticks
+				&& fp_it->second.owner_uid == fingerprint.owner_uid) {
 				continue;
 			}
 
@@ -558,13 +708,16 @@ private:
 		for (const auto& [path, new_hash] : hashed_results) {
 			auto existing = file_hashes_.find(path);
 			if (existing == file_hashes_.end()) {
+				if (baseline_ready_ && isUserOwnedPath(path)) {
+					logger_.fileCreated(path, new_hash);
+				}
 				file_hashes_[path] = new_hash;
 				hashes_changed = true;
 				continue;
 			}
 
 			if (existing->second != new_hash) {
-				if (!isIgnoredRuntimePath(path)) {
+				if (!isIgnoredRuntimePath(path) && isUserOwnedPath(path)) {
 					logger_.fileModified(path, existing->second, new_hash);
 				}
 				if (targets[path]) {
@@ -577,13 +730,24 @@ private:
 		if (hashes_changed && !saveHashes(options_.hash_db_file, file_hashes_)) {
 			logger_.warn(std::format("Failed to save hash DB file: {}", options_.hash_db_file));
 		}
+
+		if (!targets.empty()) {
+			baseline_ready_ = true;
+		}
 	}
 
-	bool pruneStaleState(const std::unordered_map<std::string, bool>& targets) {
+	bool pruneStaleState(
+		const std::unordered_map<std::string, bool>& targets,
+		const std::vector<std::string>& configured_roots) {
 		bool changed = false;
 
 		for (auto it = file_hashes_.begin(); it != file_hashes_.end();) {
 			if (!targets.contains(it->first)) {
+				const bool user_owned = isUserOwnedPath(it->first);
+				if (baseline_ready_ && user_owned && !isIgnoredRuntimePath(it->first)
+					&& isUnderConfiguredRoots(it->first, configured_roots)) {
+					logger_.fileDeleted(it->first, it->second);
+				}
 				it = file_hashes_.erase(it);
 				changed = true;
 				continue;
@@ -602,10 +766,47 @@ private:
 		return changed;
 	}
 
-	static void collectTargetFiles(const std::vector<FileEntry>& entries, std::unordered_map<std::string, bool>& targets) {
+	void buildConfiguredRoots(const std::vector<FileEntry>& entries, std::vector<std::string>& roots) const {
+		roots.clear();
+		roots.reserve(entries.size());
+		for (const auto& entry : entries) {
+			std::string normalized = stripTrailingSeparators(normalizePath(fs::path(entry.path)));
+			if (normalized.empty() || isIgnoredRuntimePath(normalized)) {
+				continue;
+			}
+			roots.push_back(std::move(normalized));
+		}
+	}
+
+	bool isUnderConfiguredRoots(const std::string& path, const std::vector<std::string>& roots) const {
+		for (const auto& root : roots) {
+			if (hasPathPrefix(path, root)) {
+				return true;
+			}
+		}
+		return false;
+	}
+
+	bool isUserOwned(uid_t owner_uid) const {
+		return owner_uid == current_uid_;
+	}
+
+	bool isUserOwnedPath(const std::string& path) const {
+		auto fp_it = file_fingerprints_.find(path);
+		if (fp_it == file_fingerprints_.end()) {
+			return false;
+		}
+		return isUserOwned(fp_it->second.owner_uid);
+	}
+
+	void collectTargetFiles(const std::vector<FileEntry>& entries, std::unordered_map<std::string, bool>& targets) const {
 		for (const auto& entry : entries) {
 			const fs::path input(entry.path);
 			std::error_code ec;
+			const std::string normalized_input = normalizePath(input);
+			if (isIgnoredRuntimePath(normalized_input)) {
+				continue;
+			}
 
 			if (!fs::exists(input, ec) || ec) {
 				continue;
@@ -629,6 +830,14 @@ private:
 
 				while (iter != end) {
 					std::error_code item_ec;
+					if (iter->is_directory(item_ec) && !item_ec) {
+						const std::string dir_path = normalizePath(iter->path());
+						if (isIgnoredRuntimePath(dir_path)) {
+							iter.disable_recursion_pending();
+						}
+					}
+
+					item_ec.clear();
 					if (iter->is_regular_file(item_ec) && !item_ec) {
 						markTarget(targets, iter->path(), entry.auto_update);
 					}
@@ -663,9 +872,9 @@ private:
 		}
 	}
 
-	static void markTarget(std::unordered_map<std::string, bool>& targets, const fs::path& path, bool auto_update) {
+	void markTarget(std::unordered_map<std::string, bool>& targets, const fs::path& path, bool auto_update) const {
 		const std::string key = normalizePath(path);
-		if (isIgnoredPath(key)) {
+		if (isIgnoredRuntimePath(key)) {
 			return;
 		}
 
@@ -688,11 +897,7 @@ private:
 		}
 
 		for (const auto& prefix : ignoredPathPrefixes()) {
-			if (normalized == prefix) {
-				return true;
-			}
-			if (normalized.size() > prefix.size() && normalized.rfind(prefix, 0) == 0
-				&& (normalized[prefix.size()] == '/' || normalized[prefix.size()] == '\\')) {
+			if (hasPathPrefix(normalized, prefix)) {
 				return true;
 			}
 		}
@@ -702,6 +907,10 @@ private:
 	bool isIgnoredRuntimePath(const std::string& normalized_path) const {
 		const std::string normalized = stripTrailingSeparators(normalized_path);
 		if (isIgnoredPath(normalized)) {
+			return true;
+		}
+
+		if (matchesIgnorePrefixes(normalized)) {
 			return true;
 		}
 
@@ -722,7 +931,30 @@ private:
 			"/.local/share/telegramdesktop/",
 			"/telemetry/",
 			"/cache/",
-			"/tmp/"
+			"/tmp/",
+			"/.git/",
+			"/.hg/",
+			"/.svn/",
+			"/node_modules/",
+			"/target/",
+			"/build/",
+			"/dist/",
+			"/out/",
+			"/__pycache__/",
+			"/.pytest_cache/",
+			"/.mypy_cache/",
+			"/.ruff_cache/",
+			"/.tox/",
+			"/.venv/",
+			"/venv/",
+			"/.gradle/",
+			"/.m2/",
+			"/.cargo/",
+			"/.net/",
+			"/.dotnet/",
+			"/.nuget/",
+			"/.local/share/spotify-launcher/",
+			"/.local/share/nvm/"
 		};
 
 		for (const auto& segment : noisy_segments) {
@@ -732,6 +964,25 @@ private:
 		}
 
 		return false;
+	}
+
+	bool matchesIgnorePrefixes(const std::string& normalized_path) const {
+		for (const auto& prefix : ignore_prefixes_) {
+			if (hasPathPrefix(normalized_path, prefix)) {
+				return true;
+			}
+		}
+		return false;
+	}
+
+	void refreshIgnorePrefixes() {
+		std::vector<std::string> prefixes;
+		std::string error;
+		if (!loadIgnorePrefixes(options_.ignore_file, prefixes, error)) {
+			logger_.warn(error);
+			return;
+		}
+		ignore_prefixes_.swap(prefixes);
 	}
 
 	static const std::vector<std::string>& ignoredPathPrefixes() {
@@ -755,6 +1006,14 @@ int main(int argc, char** argv) {
 
 	std::signal(SIGINT, signalHandler);
 	std::signal(SIGTERM, signalHandler);
+
+	if (options.daemon) {
+		std::string daemon_error;
+		if (!daemonizeProcess(daemon_error)) {
+			std::cerr << "Failed to daemonize: " << daemon_error << '\n';
+			return 1;
+		}
+	}
 
 	Logger logger(options.log_file);
 	logger.info(std::format(
